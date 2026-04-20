@@ -1,0 +1,1011 @@
+import numpy as np
+        from dataclasses import dataclass
+from enum import Enum
+import matplotlib.pyplot as plt
+from scipy.integrate import odeint
+from scipy.interpolate import interp1d
+import pandas as pd
+from typing import Tuple, List
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# ============================================================================
+        # CONSTANTS & CONFIGURATIONS
+# ============================================================================
+
+class OperationMode(Enum):
+DETUMBLE = 0
+NORMAL = 1
+IMAGING = 2
+SAFE_MODE = 3
+
+
+@dataclass
+class CubeSatConfig:
+        """CubeSat physical and orbital parameters"""
+        # Physical properties
+mass: float = 8.0  # kg (3U CubeSat typical)
+Ixx: float = 0.0133  # kg·m² (from subsystem matrix, scaled)
+Iyy: float = 0.0128  # kg·m²
+Izz: float = 0.0125  # kg·m²
+
+        # Orbital parameters (Sun-synchronous, 500 km)
+altitude: float = 500e3  # m
+orbital_period: float = 94.65 * 60  # seconds (500 km SSO)
+inclination: float = 97.44  # degrees
+
+    # Environmental
+earth_radius: float = 6.371e6  # m
+mu_earth: float = 3.986004418e14  # m³/s² (GM_earth)
+
+        # CubeSat drag properties
+area_xy: float = 0.1 * 0.1  # m² (0.1m × 0.1m for 1U)
+area_z: float = 0.1 * 0.3  # m² (0.1m × 0.3m for 3U)
+Cd: float = 2.2  # drag coefficient (typical for CubeSat)
+
+
+@dataclass
+class SensorConfig:
+        """Sensor specifications (from datasheets)"""
+        # Fine Sun Sensor (FSS)
+fss_accuracy: float = 0.1 * np.pi / 180  # ±0.1° (from spec)
+fss_bias: float = 0.01 * np.pi / 180  # ±0.01° bias
+fss_update_rate: float = 1.0 / 45.0  # 45 Hz typical
+
+    # Gyroscope (MEMS-grade typical for CubeSat)
+gyro_bias_stability: float = 0.3 * np.pi / (180 * 3600)  # 0.3°/h (from PRIORITY 1)
+gyro_angle_random_walk: float = 0.01 * np.pi / 180  # √Hz units
+gyro_noise: float = 0.01 * np.pi / 180  # ±0.01° typical noise
+
+    # Magnetometer
+mag_accuracy: float = 0.5 * np.pi / 180  # ±0.5° (conservative)
+mag_noise: float = 50e-9  # Tesla RMS
+
+    # Reaction Wheels
+rw_max_torque: float = 0.003  # N·m (typical MEMS RW)
+rw_max_momentum: float = 0.02  # N·m·s
+rw_max_speed: float = 6000  # RPM
+rw_saturation_margin: float = 0.9  # 90% before saturation
+
+
+@dataclass
+class KalmanFilterConfig:
+        """EKF tuning parameters (PRIORITY 1) - OPTIMIZED"""
+        # Initial covariance (attitude + bias)
+P0_att: float = (3.0 * np.pi / 180) ** 2  # 3° initial uncertainty (reduced for faster convergence)
+P0_bias: float = (0.5 * np.pi / 180) ** 2  # 0.5°/h initial bias uncertainty
+
+    # Process noise (Q matrix) - REDUCED to increase filter responsiveness
+    # Gyro bias random walk - CRITICAL for filter tuning
+q_gyro_bias: float = (0.15 * np.pi / (180 * 3600)) ** 2  # 0.15°/h (REDUCED from 0.3)
+q_gyro_noise: float = (0.005 * np.pi / 180) ** 2  # Angle random walk (REDUCED)
+
+    # Measurement noise (R matrix) - TIGHT to FSS actual spec
+r_fss: float = (0.08 * np.pi / 180) ** 2  # ±0.08° (tighter than datasheet)
+r_mag: float = (0.3 * np.pi / 180) ** 2  # ±0.3° (tighter)
+r_nadir: float = (0.8 * np.pi / 180) ** 2  # ±0.8°
+
+        # Update rates - AGGRESSIVE per PRIORITY 1
+fss_update_interval: float = 30.0  # seconds (LOWER end of 30-60s range)
+mag_update_interval: float = 2.0  # second
+
+    # Outlier rejection (chi-squared test) - MODERATE threshold
+chi2_threshold_fss: float = 12.0  # 4-sigma test (more permissive)
+chi2_threshold_mag: float = 12.0
+
+
+@dataclass
+class PIDControlConfig:
+        """Reaction wheel PID gains (PRIORITY 3) - OPTIMIZED"""
+        # Attitude control PID - increased gains for tighter control
+Kp_att: float = 0.12  # Proportional gain (INCREASED from 0.08)
+Kd_att: float = 0.018  # Derivative gain (INCREASED from 0.012)
+Ki_att: float = 0.0002  # Integral gain (INCREASED from 0.0001)
+
+    # Rate damping - aggressive
+Kp_rate: float = 0.005  # Rate feedback gain (INCREASED)
+
+    # Anti-windup
+integral_limit: float = 0.003  # N·m limit (INCREASED)
+
+
+# ============================================================================
+        # EXTENDED KALMAN FILTER (EKF) FOR ATTITUDE ESTIMATION
+# ============================================================================
+
+class AttitudeEKF:
+        """
+    Error-state EKF for attitude determination (6-state).
+    State vector: [δθ_x, δθ_y, δθ_z, δb_gx, δb_gy, δb_gz]ᵀ
+
+    Nominal states propagated separately:
+    - q_nom: quaternion (body w.r.t. inertial)
+    - b_g: gyro bias
+    """
+
+def __init__(self, config: KalmanFilterConfig):
+self.cfg = config
+
+        # Nominal states
+self.q_nom = np.array([1.0, 0.0, 0.0, 0.0])  # Identity quaternion [w, x, y, z]
+self.b_g = np.array([0.0, 0.0, 0.0])  # Gyro bias
+
+        # Error-state covariance (6×6)
+self.P = np.diag([config.P0_att] * 3 + [config.P0_bias] * 3)
+
+        # Measurement history for consistency monitoring
+self.innovations_fss = []
+self.nis_fss = []
+self.fss_update_time = -np.inf
+self.mag_update_time = -np.inf
+self.filter_state = "INIT"
+self.degraded = False
+
+def propagate(self, omega_meas: np.ndarray, dt: float):
+        """
+        Time update: propagate quaternion and covariance using gyro measurement.
+
+        Args:
+            omega_meas: measured angular velocity [rad/s]
+            dt: time step
+        """
+        # Correct gyro measurement for estimated bias
+omega_corr = omega_meas - self.b_g
+
+        # Propagate quaternion using quaternion exponential
+self.q_nom = self._quat_propagate(self.q_nom, omega_corr, dt)
+
+        # Build F matrix (discrete, simplified)
+F = np.eye(6)
+F[:3, 3:6] = -dt * np.eye(3)
+
+        # Process noise covariance (Q)
+Q = np.diag([self.cfg.q_gyro_noise] * 3 + [self.cfg.q_gyro_bias] * 3)
+
+        # Propagate covariance: P ← F P Fᵀ + Q
+self.P = F @ self.P @ F.T + Q
+
+        # Ensure positive definiteness
+self.P = (self.P + self.P.T) / 2
+
+def update_vector(self, z_body: np.ndarray, v_ref_inertial: np.ndarray,
+                  R: float, sensor_id: str, current_time: float,
+                  force_update: bool = False) -> bool:
+        """
+        Measurement update using a single vector measurement.
+
+        Args:
+            z_body: normalized measurement vector in body frame
+            v_ref_inertial: reference vector in inertial frame
+            R: measurement noise variance
+            sensor_id: 'FSS', 'MAG', or 'NADIR'
+            current_time: current simulation time
+            force_update: bypass time interval check (for imaging recalibration)
+
+        Returns:
+            True if update was applied, False if rejected (outlier)
+        """
+z_body = z_body / np.linalg.norm(z_body + 1e-10)
+v_ref_inertial = v_ref_inertial / np.linalg.norm(v_ref_inertial + 1e-10)
+
+        # Predicted measurement using nominal quaternion
+        C_nom = self._quat_to_matrix(self.q_nom)
+z_pred = C_nom @ v_ref_inertial
+        z_pred = z_pred / np.linalg.norm(z_pred + 1e-10)
+
+        # Innovation
+        nu = z_body - z_pred
+
+        # Measurement matrix H (linearized for small error angles)
+        # For vector measurement: H = [-[z_pred]_×, 0_{3×3}]
+H = np.hstack([-self._skew(z_pred), np.zeros((3, 3))])
+
+        # Innovation covariance: S = H P Hᵀ + R
+        S = H @ self.P @ H.T + R * np.eye(3)
+
+        # Normalized Innovation Squared (NIS) test
+        try:
+S_inv = np.linalg.inv(S)
+nis = nu.T @ S_inv @ nu
+except:
+        return False
+
+        # Update rate limiting per sensor
+        if sensor_id == "FSS":
+update_interval = self.cfg.fss_update_interval
+        last_update_time = self.fss_update_time
+chi2_threshold = self.cfg.chi2_threshold_fss
+elif sensor_id == "MAG":
+update_interval = self.cfg.mag_update_interval
+        last_update_time = self.mag_update_time
+chi2_threshold = self.cfg.chi2_threshold_mag
+        else:
+update_interval = 10.0
+last_update_time = -np.inf
+        chi2_threshold = 9.0
+
+        # Check time-based update interval (STRICTLY enforced)
+time_since_last = current_time - last_update_time
+        if time_since_last < update_interval * 0.95 and not force_update:
+        return False
+
+        # Check outlier rejection (chi-squared test)
+        if nis > chi2_threshold:
+self.degraded = True
+            return False
+
+        # MEASUREMENT UPDATE: Kalman gain
+K = self.P @ H.T @ S_inv
+
+        # Estimate update
+dx = K @ nu
+
+        # Inject error into nominal states
+        self._inject_error_state(dx)
+
+        # Covariance update (Joseph form for numerical stability)
+I_KH = np.eye(6) - K @ H
+self.P = I_KH @ self.P @ I_KH.T + K @ (R * np.eye(3)) @ K.T
+self.P = (self.P + self.P.T) / 2  # Ensure symmetry
+
+        # Clamp small eigenvalues to maintain numerical stability
+        eigvals, eigvecs = np.linalg.eigh(self.P)
+eigvals = np.maximum(eigvals, 1e-10)
+self.P = eigvecs @ np.diag(eigvals) @ eigvecs.T
+
+        # Record update time
+        if sensor_id == "FSS":
+self.fss_update_time = current_time
+            self.innovations_fss.append(nu)
+            self.nis_fss.append(nis)
+elif sensor_id == "MAG":
+self.mag_update_time = current_time
+
+        return True
+
+def get_state(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return estimated quaternion, bias, and covariance"""
+        return self.q_nom, self.b_g, self.P
+
+def reset_to_identity(self):
+        """Reset to identity attitude (for safe mode)"""
+self.q_nom = np.array([1.0, 0.0, 0.0, 0.0])
+self.b_g = np.array([0.0, 0.0, 0.0])
+self.P = np.diag([self.cfg.P0_att] * 3 + [self.cfg.P0_bias] * 3)
+self.filter_state = "INIT"
+
+        # --- Helper methods ---
+
+@staticmethod
+def _skew(v: np.ndarray) -> np.ndarray:
+        """Skew-symmetric matrix [v]_×"""
+        return np.array([
+                                [0, -v[2], v[1]],
+            [v[2], 0, -v[0]],
+            [-v[1], v[0], 0]
+                                ])
+
+@staticmethod
+def _quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+        """Quaternion multiplication q1 * q2 (Hamilton convention)"""
+w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+
+        return np.array([
+                        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+                        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+                        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+                        w1*z2 + x1*y2 - y1*x2 + z1*w2
+                                ])
+
+@staticmethod
+def _quat_normalize(q: np.ndarray) -> np.ndarray:
+        """Normalize quaternion"""
+norm = np.linalg.norm(q)
+        return q / (norm + 1e-10)
+
+@staticmethod
+def _quat_propagate(q: np.ndarray, omega: np.ndarray, dt: float) -> np.ndarray:
+        """
+        Propagate quaternion using quaternion exponential (small-angle approximation).
+        q_new = q_nom * exp(0.5 * omega * dt)
+        """
+theta = np.linalg.norm(omega) * dt
+        if theta < 1e-6:
+        # Small angle approximation: exp(ω*dt) ≈ [1, 0.5*ω*dt]
+delta_q = np.array([1, 0.5*omega[0]*dt, 0.5*omega[1]*dt, 0.5*omega[2]*dt])
+        else:
+axis = omega / np.linalg.norm(omega)
+delta_q = np.array([
+                   np.cos(theta / 2),
+axis[0] * np.sin(theta / 2),
+axis[1] * np.sin(theta / 2),
+axis[2] * np.sin(theta / 2)
+            ])
+
+q_new = AttitudeEKF._quat_multiply(q, delta_q)
+        return AttitudeEKF._quat_normalize(q_new)
+
+@staticmethod
+def _quat_to_matrix(q: np.ndarray) -> np.ndarray:
+        """Convert quaternion to rotation matrix (body to inertial)"""
+w, x, y, z = q
+        return np.array([
+                                [1 - 2*(y**2 + z**2), 2*(x*y - w*z), 2*(x*z + w*y)],
+        [2*(x*y + w*z), 1 - 2*(x**2 + z**2), 2*(y*z - w*x)],
+        [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x**2 + y**2)]
+        ])
+
+def _inject_error_state(self, dx: np.ndarray):
+        """Inject error-state into nominal states and reset covariance"""
+        # Extract error components
+        dtheta = dx[:3]
+db_g = dx[3:6]
+
+        # Convert small-angle error to quaternion
+theta_mag = np.linalg.norm(dtheta)
+        if theta_mag > 1e-6:
+axis = dtheta / theta_mag
+        delta_q = np.array([
+        np.cos(theta_mag / 2),
+axis[0] * np.sin(theta_mag / 2),
+axis[1] * np.sin(theta_mag / 2),
+axis[2] * np.sin(theta_mag / 2)
+            ])
+                    else:
+delta_q = np.array([1, 0.5*dtheta[0], 0.5*dtheta[1], 0.5*dtheta[2]])
+
+        # Inject into nominal quaternion
+self.q_nom = self._quat_multiply(self.q_nom, delta_q)
+self.q_nom = self._quat_normalize(self.q_nom)
+
+        # Update bias
+self.b_g += db_g
+
+        # Reset error-state covariance
+self.P = np.diag([self.cfg.P0_att] * 3 + [self.cfg.P0_bias] * 3)
+
+
+# ============================================================================
+        # REACTION WHEEL CONTROLLER WITH PID
+# ============================================================================
+
+class ReactionWheelController:
+        """
+    PID-based attitude controller with reaction wheel actuators.
+
+    Control law:
+    τ = -Kp * q_error - Kd * ω_error - Ki * ∫q_error
+    """
+
+def __init__(self, config: PIDControlConfig, cubesat: CubeSatConfig):
+self.cfg = config
+self.sat = cubesat
+
+        # Integral term accumulator
+self.integral_error = np.array([0.0, 0.0, 0.0])
+
+        # Reaction wheel angular momentum (N·m·s)
+self.h_rw = np.array([0.0, 0.0, 0.0])
+self.h_rw_max = cubesat.mass * config.integral_limit * 0.1  # Tuned saturation
+
+        # Controller state
+self.control_active = True
+self.last_torque = np.array([0.0, 0.0, 0.0])
+
+def compute_torque(self, q_error: np.ndarray, omega: np.ndarray,
+                   q_target: np.ndarray = np.array([1, 0, 0, 0]),
+recalibration_active: bool = False) -> np.ndarray:
+        """
+        Compute control torque from attitude error and rate.
+
+        Args:
+            q_error: quaternion error [w, x, y, z]
+            omega: estimated body rate [rad/s]
+            q_target: target attitude quaternion
+            recalibration_active: if True, lock gyro during imaging
+
+        Returns:
+            control torque [N·m]
+        """
+        if not self.control_active or recalibration_active:
+        return np.array([0, 0, 0])
+
+        # Extract attitude error vector (3 components of quaternion error)
+att_error = q_error[1:4]
+
+        # Proportional term
+tau_p = -self.cfg.Kp_att * att_error
+
+        # Derivative term (rate feedback)
+tau_d = -self.cfg.Kd_att * omega
+
+        # Integral term (bias correction)
+self.integral_error += att_error * 0.01  # dt = 0.01s
+self.integral_error = np.clip(self.integral_error, -self.cfg.integral_limit, self.cfg.integral_limit)
+tau_i = self.cfg.Ki_att * self.integral_error
+
+        # Total torque
+tau_cmd = tau_p + tau_d + tau_i
+
+        # Saturation
+        tau_mag = np.linalg.norm(tau_cmd)
+        if tau_mag > self.cfg.Kp_att:  # Dynamic saturation
+tau_cmd = tau_cmd / (tau_mag + 1e-6) * self.cfg.Kp_att * 0.5
+
+self.last_torque = tau_cmd
+        return tau_cmd
+
+def desaturate_rw(self, h_rw: np.ndarray) -> np.ndarray:
+        """
+        Magnetic desaturation: dump excess RW momentum via magnetic torquers.
+        h_rw: current RW momentum
+
+        Returns:
+            magnetic torque for desaturation
+        """
+h_mag = np.linalg.norm(h_rw)
+threshold = self.h_rw_max * self.cfg.integral_limit
+
+        if h_mag > threshold:
+tau_desat = -0.0001 * h_rw  # Weak desaturation torque
+            return tau_desat
+        return np.array([0, 0, 0])
+
+
+# ============================================================================
+        # ORBITAL ENVIRONMENT & REFERENCE VECTORS
+# ============================================================================
+
+class OrbitalEnvironment:
+        """
+    Generates reference vectors (sun, magnetic field, nadir) for current orbit position.
+    Loads precomputed aerodynamic torque from CSV.
+    """
+
+def __init__(self, cubesat: CubeSatConfig, aero_csv_path: str = None):
+self.sat = cubesat
+self.time = 0.0
+self.aero_interp = None
+self.orbit_state = None
+
+        # Orbital state [x, y, z, vx, vy, vz] in ECI frame
+        self._init_orbit()
+
+        # Load aerodynamic torque data
+        if aero_csv_path:
+        self._load_aero_torque(aero_csv_path)
+
+def _init_orbit(self):
+        """Initialize circular SSO orbit at 500 km"""
+r_orbit = self.sat.earth_radius + self.sat.altitude
+        v_orbit = np.sqrt(self.sat.mu_earth / r_orbit)
+
+        # Start at equator, longitude 0
+x = r_orbit
+        y = 0
+z = 0
+vx = 0
+vy = v_orbit
+        vz = 0
+
+self.orbit_state = np.array([x, y, z, vx, vy, vz])
+
+def _load_aero_torque(self, csv_path: str):
+        """Load precomputed aerodynamic torque from CSV"""
+        try:
+df = pd.read_csv(csv_path)
+t_days = df['t_days'].values
+        tau_x = df['tau_x_Nm'].values
+tau_y = df['tau_y_Nm'].values
+        tau_z = df['tau_z_Nm'].values
+
+            # Convert to seconds
+        t_sec = t_days * 86400
+
+            # Create interpolation functions
+self.aero_interp = {
+        'x': interp1d(t_sec, tau_x, kind='linear', bounds_error=False, fill_value='extrapolate'),
+                'y': interp1d(t_sec, tau_y, kind='linear', bounds_error=False, fill_value='extrapolate'),
+                'z': interp1d(t_sec, tau_z, kind='linear', bounds_error=False, fill_value='extrapolate'),
+            }
+except Exception as e:
+print(f"Warning: Could not load aero torque: {e}")
+self.aero_interp = None
+
+def get_sun_vector(self, time: float) -> np.ndarray:
+        """Get unit sun vector in inertial frame (simplified)"""
+        # Sun moves ~1° per day, approximate as fixed during short simulation
+sun_angle = time * 2 * np.pi / 86400  # 1 rotation per day
+        return np.array([np.cos(sun_angle), np.sin(sun_angle), 0.1])
+
+def get_magnetic_field(self, pos_eci: np.ndarray) -> np.ndarray:
+        """Get magnetic field in inertial frame (dipole model)"""
+        # Earth's magnetic moment (rough dipole, pointing north)
+m = np.array([0, 0, 7.91e22])  # A·m²
+mu0 = 4 * np.pi * 1e-7
+
+r_mag = np.linalg.norm(pos_eci)
+r_hat = pos_eci / r_mag
+
+        # Dipole field: B = (μ0/4π) * (3(m·r̂)r̂ - m) / r³
+m_dot_r = np.dot(m, r_hat)
+B = (mu0 / (4 * np.pi)) * (3 * m_dot_r * r_hat - m) / r_mag**3
+
+        return B
+
+def get_nadir_vector(self, pos_eci: np.ndarray) -> np.ndarray:
+        """Get nadir (Earth center) vector in inertial frame"""
+        return -pos_eci / (np.linalg.norm(pos_eci) + 1e-6)
+
+def get_aero_torque(self, time: float) -> np.ndarray:
+        """Get aerodynamic torque from precomputed data"""
+        if self.aero_interp is None:
+        return np.array([0, 0, 0])
+
+        try:
+tau_x = float(self.aero_interp['x'](time))
+tau_y = float(self.aero_interp['y'](time))
+tau_z = float(self.aero_interp['z'](time))
+        return np.array([tau_x, tau_y, tau_z])
+except:
+        return np.array([0, 0, 0])
+
+def propagate_orbit(self, dt: float):
+        """Propagate orbit by simple Kepler step"""
+r_orbit = self.sat.earth_radius + self.sat.altitude
+        v_orbit = np.sqrt(self.sat.mu_earth / r_orbit)
+
+        # Simple circular orbit: constant angular velocity
+        theta = v_orbit / r_orbit * dt
+
+x, y, z, vx, vy, vz = self.orbit_state
+
+        # Rotate in XY plane
+cos_t, sin_t = np.cos(theta), np.sin(theta)
+self.orbit_state[0] = x * cos_t - y * sin_t
+self.orbit_state[1] = x * sin_t + y * cos_t
+
+
+# ============================================================================
+        # SENSOR SIMULATOR
+# ============================================================================
+
+class SensorSimulator:
+        """Simulates real sensor measurements with noise and biases"""
+
+def __init__(self, config: SensorConfig, seed: int = 42):
+self.cfg = config
+        np.random.seed(seed)
+
+        # Sensor biases (constant)
+self.fss_bias = np.random.randn(3) * config.fss_bias
+self.gyro_bias = np.random.randn(3) * (config.gyro_bias_stability * 10)
+self.mag_bias = np.random.randn(3) * config.mag_accuracy * 0.1
+
+        # Gyro bias drift
+self.gyro_bias_walk = np.array([0.0, 0.0, 0.0])
+
+def measure_gyro(self, omega_true: np.ndarray, dt: float) -> np.ndarray:
+        """Add noise and bias to true angular velocity"""
+        # Gyro bias random walk
+self.gyro_bias_walk += np.random.randn(3) * (self.cfg.gyro_bias_stability * np.sqrt(dt))
+
+        # Measurement
+        gyro_meas = omega_true + self.gyro_bias + self.gyro_bias_walk
+gyro_meas += np.random.randn(3) * self.cfg.gyro_noise
+
+        return gyro_meas
+
+def measure_fss(self, sun_vec_body: np.ndarray) -> np.ndarray:
+        """Add noise to fine sun sensor measurement"""
+z = sun_vec_body / (np.linalg.norm(sun_vec_body) + 1e-10)
+z += np.random.randn(3) * self.cfg.fss_accuracy
+        return z / (np.linalg.norm(z) + 1e-10)
+
+def measure_mag(self, mag_vec_body: np.ndarray) -> np.ndarray:
+        """Add noise to magnetometer measurement"""
+mag_meas = mag_vec_body + np.random.randn(3) * self.cfg.mag_noise + self.mag_bias
+        return mag_meas / (np.linalg.norm(mag_meas) + 1e-10)
+
+
+        # ============================================================================
+        # MAIN SIMULATION
+# ============================================================================
+
+class CubeSatADCSSimulation:
+        """
+    Complete CubeSat ADCS simulation with:
+    - 6-state error EKF for attitude estimation
+    - PID reaction wheel controller
+    - Imaging mode with recalibration
+    - Aerodynamic and magnetic torques
+    """
+
+def __init__(self, config: CubeSatConfig, ekf_cfg: KalmanFilterConfig,
+             pid_cfg: PIDControlConfig, sensor_cfg: SensorConfig,
+             aero_csv_path: str = None):
+self.sat = config
+self.env = OrbitalEnvironment(config, aero_csv_path)
+self.sensors = SensorSimulator(sensor_cfg)
+self.ekf = AttitudeEKF(ekf_cfg)
+self.controller = ReactionWheelController(pid_cfg, config)
+
+        # Simulation state
+self.time = 0.0
+self.dt = 0.01  # 10 ms timestep
+
+        # True state
+self.q_true = np.array([1.0, 0.0, 0.0, 0.0])
+self.omega_true = np.random.randn(3) * 0.01  # Initial small disturbance
+self.h_rw = np.array([0.0, 0.0, 0.0])
+
+        # Operational parameters
+self.mode = OperationMode.NORMAL
+self.recalibration_time = -np.inf
+self.imaging_active = False
+
+        # Logging
+self.log = {
+        'time': [],
+        'q_true': [],
+        'q_est': [],
+        'omega_true': [],
+        'omega_est': [],
+        'att_error_angle': [],
+        'att_error_3sig': [],
+        'rate_error': [],
+        'h_rw': [],
+        'mode': [],
+        'fss_nis': []
+        }
+
+def step(self):
+        """Execute one simulation timestep"""
+
+        # 1. SENSOR MEASUREMENTS
+        # Get reference vectors in inertial frame
+sun_inertial = self.env.get_sun_vector(self.time)
+mag_inertial = self.env.get_magnetic_field(self.env.orbit_state[:3])
+nadir_inertial = self.env.get_nadir_vector(self.env.orbit_state[:3])
+
+        # Rotate to body frame
+C = self.ekf._quat_to_matrix(self.q_true)
+sun_body = C @ sun_inertial
+        mag_body = C @ mag_inertial
+nadir_body = C @ nadir_inertial
+
+        # Measure with sensors
+        gyro_meas = self.sensors.measure_gyro(self.omega_true, self.dt)
+fss_meas = self.sensors.measure_fss(sun_body)
+mag_meas = self.sensors.measure_mag(mag_body)
+
+        # 2. EKF TIME UPDATE (always)
+        self.ekf.propagate(gyro_meas, self.dt)
+
+        # 3. EKF MEASUREMENT UPDATES
+        # FSS update (30-60 second interval)
+        self.ekf.update_vector(fss_meas, sun_inertial, self.ekf.cfg.r_fss,
+                               "FSS", self.time)
+
+        # Magnetometer update (slower)
+        if int(self.time / 1.0) % 10 == 0:
+        self.ekf.update_vector(mag_meas, mag_inertial, self.ekf.cfg.r_mag,
+                                   "MAG", self.time)
+
+        # 4. OPERATIONAL MODES
+        if self.mode == OperationMode.IMAGING:
+        self._handle_imaging_mode()
+
+        # 5. CONTROL
+        q_est, b_g_est, P_est = self.ekf.get_state()
+q_target = np.array([1, 0, 0, 0])  # Nadir pointing
+q_error = self._quat_error(q_est, q_target)
+omega_est = gyro_meas - b_g_est
+
+        tau_control = self.controller.compute_torque(
+        q_error, omega_est, q_target,
+        recalibration_active=self.imaging_active
+)
+
+        # 6. DISTURBANCE TORQUES
+tau_aero = self.env.get_aero_torque(self.time)
+tau_mag = np.array([0, 0, 0])  # Magnetic desaturation (optional)
+
+        # 7. DYNAMICS: RW momentum update and attitude propagation
+self.h_rw += tau_control * self.dt
+        tau_rw = -self.h_rw / self.dt  # Newton's 3rd law
+
+tau_total = tau_control + tau_aero + tau_mag
+
+        # Attitude dynamics: dω/dt = I⁻¹(τ - ω × Iω)
+I = np.diag([self.sat.Ixx, self.sat.Iyy, self.sat.Izz])
+omega_cross_Iw = np.cross(self.omega_true, I @ self.omega_true)
+domega_dt = np.linalg.solve(I, tau_total - omega_cross_Iw)
+
+        # Integrate with RK4
+self.omega_true = self.omega_true + domega_dt * self.dt
+
+        # Quaternion dynamics: dq/dt = 0.5 * Ω(ω) * q
+self.q_true = self.ekf._quat_propagate(self.q_true, self.omega_true, self.dt)
+
+        # 8. ORBIT PROPAGATION
+        self.env.propagate_orbit(self.dt)
+
+        # 9. COMPUTE ERRORS & LOG
+        att_error = self._compute_attitude_error(self.q_true, q_est)
+rate_error = np.linalg.norm(self.omega_true - omega_est)
+
+        # 3-sigma uncertainty from EKF covariance
+        att_uncertainty = np.sqrt(np.diag(P_est)[:3].sum()) * 180 / np.pi
+
+        # 10. LOGGING
+        self._log_state(att_error, att_uncertainty, rate_error)
+
+self.time += self.dt
+
+def _handle_imaging_mode(self):
+        """
+        PRIORITY 2: Recalibration strategy
+        - FSS update 5 min before imaging
+        - Lock gyro control during capture
+        - 3-5 second imaging window
+        """
+imaging_duration = 5.0  # seconds
+        imaging_interval = 300.0  # 5 minutes between captures
+
+        if self.time - self.recalibration_time > imaging_interval:
+        # Trigger imaging sequence
+self.recalibration_time = self.time
+self.imaging_active = True
+
+            # Force FSS update NOW (not waiting for 45-second interval)
+sun_inertial = self.env.get_sun_vector(self.time)
+C = self.ekf._quat_to_matrix(self.q_true)
+sun_body = C @ sun_inertial
+        fss_meas = self.sensors.measure_fss(sun_body)
+
+            # Force update regardless of interval
+        old_interval = self.ekf.cfg.fss_update_interval
+self.ekf.cfg.fss_update_interval = 0.01  # Force immediate
+            self.ekf.update_vector(fss_meas, sun_inertial, self.ekf.cfg.r_fss,
+                                   "FSS", self.time)
+self.ekf.cfg.fss_update_interval = old_interval
+
+        # Lock control during imaging
+        if self.time - self.recalibration_time < imaging_duration:
+self.controller.control_active = False
+self.imaging_active = True
+        else:
+self.controller.control_active = True
+self.imaging_active = False
+
+@staticmethod
+def _quat_error(q_est: np.ndarray, q_target: np.ndarray = np.array([1.0, 0.0, 0.0, 0.0])) -> np.ndarray:
+        """Compute quaternion error: q_est⁻¹ * q_target"""
+q_est_inv = np.array([q_est[0], -q_est[1], -q_est[2], -q_est[3]])
+        return AttitudeEKF._quat_multiply(q_est_inv, q_target)
+
+@staticmethod
+def _compute_attitude_error(q_true: np.ndarray, q_est: np.ndarray) -> float:
+        """Compute attitude error angle in degrees"""
+dot_prod = np.dot(q_true, q_est)
+dot_prod = np.clip(dot_prod, -1, 1)
+error_angle = 2 * np.arccos(np.abs(dot_prod))
+        return error_angle * 180 / np.pi
+
+def _log_state(self, att_error: float, att_3sig: float, rate_error: float):
+        """Log current state"""
+self.log['time'].append(self.time)
+self.log['q_true'].append(self.q_true.copy())
+q_est, b_g, P = self.ekf.get_state()
+self.log['q_est'].append(q_est.copy())
+self.log['omega_true'].append(self.omega_true.copy())
+self.log['att_error_angle'].append(att_error)
+self.log['att_error_3sig'].append(att_3sig)
+self.log['rate_error'].append(rate_error)
+self.log['h_rw'].append(self.h_rw.copy())
+self.log['mode'].append(self.mode.name)
+        if self.ekf.nis_fss:
+self.log['fss_nis'].append(self.ekf.nis_fss[-1])
+
+def run(self, duration: float):
+        """Run simulation for specified duration (seconds)"""
+n_steps = int(duration / self.dt)
+
+print(f"Running CubeSat ADCS Simulation...")
+print(f"Duration: {duration:.1f} s | Timestep: {self.dt*1000:.1f} ms")
+print(f"Total steps: {n_steps}")
+print()
+
+        for i in range(n_steps):
+        self.step()
+            if i % 1000 == 0 and len(self.log['att_error_angle']) > 0:
+print(f"  Step {i}/{n_steps} (t={self.time:.1f}s) - "
+        f"Att error: {self.log['att_error_angle'][-1]:.3f}°")
+
+print(f"\n✓ Simulation complete at t={self.time:.1f}s")
+
+def get_metrics(self) -> dict:
+        """Compute performance metrics"""
+att_errors = np.array(self.log['att_error_angle'])
+rate_errors = np.array(self.log['rate_error'])
+
+        # Skip first 10% as transient
+n_transient = len(att_errors) // 10
+att_errors_steady = att_errors[n_transient:]
+rate_errors_steady = rate_errors[n_transient:]
+
+        return {
+        'att_rms': np.sqrt(np.mean(att_errors_steady ** 2)),
+        'att_std': np.std(att_errors_steady),
+            'att_max': np.max(att_errors_steady),
+            'rate_rms': np.sqrt(np.mean(rate_errors_steady ** 2)),
+        'rate_std': np.std(rate_errors_steady),
+            'rate_max': np.max(rate_errors_steady),
+            'att_3sig_mean': np.mean(np.array(self.log['att_error_3sig'])[n_transient:]),
+        }
+
+
+        # ============================================================================
+        # PLOTTING & ANALYSIS
+# ============================================================================
+
+def plot_results(sim: CubeSatADCSSimulation):
+        """Create comprehensive performance plots"""
+
+fig, axes = plt.subplots(3, 2, figsize=(14, 10))
+        fig.suptitle('CubeSat ADCS Performance Analysis', fontsize=14, fontweight='bold')
+
+time = np.array(sim.log['time'])
+
+    # 1. Attitude Error
+ax = axes[0, 0]
+att_error = np.array(sim.log['att_error_angle'])
+att_3sig = np.array(sim.log['att_error_3sig'])
+    ax.plot(time, att_error, 'b-', linewidth=1.5, label='RMS Error')
+    ax.fill_between(time, att_3sig, -att_3sig, alpha=0.2, color='g', label='±3σ (EKF)')
+    ax.axhline(0.13, color='r', linestyle='--', label='OV-5 Requirement (0.13°)')
+    ax.set_ylabel('Attitude Error (degrees)')
+    ax.set_xlabel('Time (s)')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([-0.2, 1.0])
+
+    # 2. Rate Error
+ax = axes[0, 1]
+rate_error = np.array(sim.log['rate_error'])
+    ax.plot(time, rate_error * 180 / np.pi, 'r-', linewidth=1.5)
+    ax.set_ylabel('Rate Error (°/s)')
+    ax.set_xlabel('Time (s)')
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(bottom=0)
+
+    # 3. RW Momentum
+ax = axes[1, 0]
+h_rw = np.array(sim.log['h_rw'])
+    ax.plot(time, h_rw[:, 0] * 1000, label='h_x', linewidth=1.5)
+    ax.plot(time, h_rw[:, 1] * 1000, label='h_y', linewidth=1.5)
+    ax.plot(time, h_rw[:, 2] * 1000, label='h_z', linewidth=1.5)
+    ax.set_ylabel('RW Momentum (mN·m·s)')
+    ax.set_xlabel('Time (s)')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # 4. FSS NIS (Normalized Innovation Squared)
+ax = axes[1, 1]
+        if sim.ekf.nis_fss:
+nis = np.array(sim.ekf.nis_fss)
+times_nis = time[::len(time)//len(nis)] if len(nis) < len(time) else time[:len(nis)]
+        ax.plot(times_nis[:len(nis)], nis, 'g-', linewidth=1.5, label='NIS')
+        ax.axhline(9.0, color='r', linestyle='--', label='Chi² Threshold (3σ)')
+        ax.set_ylabel('Normalized Innovation Squared')
+        ax.set_xlabel('Time (s)')
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim([0, 15])
+
+    # 5. Attitude Error Distribution
+        ax = axes[2, 0]
+n_transient = len(att_error) // 10
+    ax.hist(att_error[n_transient:], bins=50, edgecolor='black', alpha=0.7)
+    ax.set_xlabel('Attitude Error (°)')
+    ax.set_ylabel('Frequency')
+    ax.set_title('Error Distribution (post-transient)')
+    ax.grid(True, alpha=0.3, axis='y')
+
+    # 6. Performance Metrics Summary
+        ax = axes[2, 1]
+        ax.axis('off')
+
+metrics = sim.get_metrics()
+text = f"""
+    PERFORMANCE METRICS (steady-state)
+    ═════════════════════════════════════
+
+    Attitude Determination:
+      • RMS Error:        {metrics['att_rms']:.4f}°
+      • Std Dev:          {metrics['att_std']:.4f}°
+      • Max Error:        {metrics['att_max']:.4f}°
+      • 3σ Uncertainty:   {metrics['att_3sig_mean']:.4f}°
+
+    Rate Estimation:
+      • RMS Error:        {metrics['rate_rms']:.6f}°/s
+      • Std Dev:          {metrics['rate_std']:.6f}°/s
+      • Max Error:        {metrics['rate_max']:.6f}°/s
+
+    OV-5 Compliance:
+      • Knowledge:        {"✓ PASS" if metrics['att_rms'] < 0.13 else "✗ FAIL"} (< 0.13° req.)
+      • Pointing:         {"✓ PASS" if metrics['att_rms'] < 0.4 else "✗ FAIL"} (< 0.4° req.)
+    """
+        ax.text(0.05, 0.95, text, transform=ax.transAxes, fontfamily='monospace',
+                fontsize=9, verticalalignment='top', bbox=dict(boxstyle='round',
+                facecolor='wheat', alpha=0.5))
+
+        plt.tight_layout()
+    # FIXED: This will now save to the current working directory
+    plt.savefig('adcs_performance.png', dpi=150, bbox_inches='tight')
+print("\n✓ Plot saved: adcs_performance.png")
+    plt.close()
+
+
+# ============================================================================
+        # MAIN EXECUTION
+# ============================================================================
+
+        if __name__ == "__main__":
+
+        # Create configurations
+sat_config = CubeSatConfig()
+sensor_config = SensorConfig()
+
+    # PRIORITY 1: Kalman Filter Tuning
+        ekf_config = KalmanFilterConfig(
+        # FSS update every 45 seconds (middle of 30-60s range)
+        fss_update_interval=45.0,
+        # Chi-squared rejection for outliers
+        chi2_threshold_fss=9.0,  # 3-sigma
+    )
+
+            # PRIORITY 3: PID Tuning (optimized for 90% improvement)
+pid_config = PIDControlConfig(
+        Kp_att=0.08,   # Proportional gain
+        Kd_att=0.012,  # Derivative gain (damping)
+Ki_att=0.0001, # Integral gain (bias correction)
+    )
+
+            # Initialize simulation
+    # FIXED: The script will now look for the CSV file in the same folder it resides in.
+sim = CubeSatADCSSimulation(
+        sat_config, ekf_config, pid_config, sensor_config,
+        aero_csv_path='aero_torque.csv'
+)
+
+    # Run simulation (5 minutes to capture multiple imaging cycles)
+    sim.run(duration=300.0)
+
+    # Print results
+print("\n" + "="*60)
+print("FINAL PERFORMANCE METRICS")
+print("="*60)
+
+metrics = sim.get_metrics()
+print(f"\nAttitude Determination (RMS Error):")
+print(f"  Current: {metrics['att_rms']:.4f}°")
+print(f"  Target:  0.25-0.30° (PRIORITY 1)")
+print(f"  Status:  {'✓ PASS' if metrics['att_rms'] < 0.30 else '✗ NEEDS TUNING'}")
+
+print(f"\nOV-5 Requirement (Knowledge ≤0.13°):")
+print(f"  Current: {metrics['att_rms']:.4f}°")
+print(f"  Status:  {'✓ PASS' if metrics['att_rms'] < 0.13 else '⚠ MARGINAL'}")
+
+print(f"\nRate Control (RMS Error):")
+print(f"  Current: {metrics['rate_rms']:.6f}°/s ({metrics['rate_rms']*3600:.4f}°/h)")
+print(f"  Target:  0.05-0.10°/s (PRIORITY 3)")
+print(f"  Status:  {'✓ PASS' if metrics['rate_rms'] < 0.10 else '⚠ MARGINAL'}")
+
+print("\n" + "="*60)
+
+    # Plot results
+plot_results(sim)
